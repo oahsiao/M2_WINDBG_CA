@@ -29,10 +29,16 @@ applyTo: "**"
 ```
 EVIDENCE FIRST.        No guessing. Every claim needs a command output reference.
 CAUSE → EFFECT.        Always reason causally, never correlate without mechanism.
-ONE ROOT CAUSE.        Not a list of suspects. Commit to one, explain the rest away.
+ONE PRIMARY CAUSE.     Commit to one primary blocker, but explicitly separate
+                       immediate blocker vs secondary amplifier when evidence
+                       shows layered failure.
 STORY MATTERS.         The report must tell what happened, in chronological order.
 FAST PATH FIRST.       If !analyze -v already has the answer, use it. Don't repeat work.
 EXCLUDE EXPLICITLY.    A good root cause also explains what it is NOT, and why.
+FOREGROUND FIRST.      In hang/live dumps, first identify the user-visible stalled
+                       path (unlock, logon, app UI, shutdown), then decide whether
+                       kernel/file-system pressure is the root blocker or only a
+                       background amplifier.
 READ THE MEMORY.       ASCII strings, pool tags, and embedded paths in raw memory are
                        direct fingerprints — they can identify the guilty driver even
                        when all other evidence is ambiguous or symbols are missing.
@@ -151,7 +157,7 @@ vertarget
 | Dump 類型 | 特徵 | 限制 |
 |---|---|---|
 | Complete Memory Dump | 全部實體記憶體 | 無限制，最完整 |
-| Kernel Memory Dump | 僅 kernel space | 無法分析 user mode stack |
+| Kernel Memory Dump | 僅 kernel space | 一般不保證有 user mode stack；但若是 Active/Bitmap dump 且 user pages 仍在，必須嘗試切入關鍵 process 取 user stack |
 | Small Memory Dump (Minidump) | 最小紀錄 | 大多數指令無效，優先用 `!analyze -v` |
 | Live Kernel Dump | 系統仍在運行 | 資料可能持續變化 |
 
@@ -277,6 +283,32 @@ lm t n
 | Lock 持有狀態 | `!locks` | deadlock 候選 |
 | 已載入驅動清單 | `lm t n` | driver scoring 基礎名單 |
 | BlackBox 紀錄 | `!blackbox*` | 系統最後狀態快照 |
+| 互動前台脈絡 | `!blackboxwinlogon` + `!process 0 0` | 分辨是前台解鎖/登入/關機卡住，還是純背景卡死 |
+
+### 前台互動脈絡強制檢查（HANG/UNKNOWN/FILESYSTEM_HANG/manual live dump 必做）
+
+若符合以下任一條件，**不可直接把 hottest kernel stack 當成 root cause**，必須先做前台互動脈絡檢查：
+
+- bugcheck 為 `0x1C8`, `0x161` 或其他 manual/live dump
+- `!blackboxwinlogon` 有內容
+- process 清單中出現 `winlogon.exe`, `LogonUI.exe`, `lsass.exe`, `LockApp.exe`
+- 使用者症狀描述與「解鎖、登入、切換使用者、AAD、雲端帳號」相關
+
+必做步驟：
+
+```
+!process 0 0
+```
+
+然後記錄是否存在以下前台 actors：
+
+- `winlogon.exe`
+- `lsass.exe`
+- `LogonUI.exe`
+- `LockApp.exe`
+- 使用者明確提到的前台 application
+
+若存在前台 actors，Phase 3 必須先走「前台鏈」再走「背景鏈」。
 
 輸出格式：
 
@@ -297,6 +329,58 @@ Skipped Commands : <哪些指令跳過及原因>
 ## PHASE 3 — Wait Chain 重建（核心分析）
 
 **目的：** 找出「誰在等誰」的完整鏈條，直到找到根源 blocker。包含循環偵測。
+
+### 步驟 3-0：前台鏈 vs 背景鏈分流
+
+在 hang 或 live dump 中，**不得只因某個 kernel stack 很熱，就直接把它當成唯一根因**。必須先回答：
+
+1. 使用者眼前卡住的是哪一條前台鏈？
+2. 系統同時還有哪些背景壓力鏈？
+3. 兩者之間有沒有被 dump 內證據直接連起來？
+
+#### 3-0A. 先找前台鏈（Foreground Chain）
+
+若 Phase 2 顯示互動前台脈絡存在，優先對以下 process 做最小必要調查：
+
+```
+!process <proc_addr> 1
+!process <proc_addr> 7
+.process /r /p <EPROCESS>
+.reload /user
+```
+
+優先順序：
+
+1. `lsass.exe`
+2. `winlogon.exe`
+3. `LogonUI.exe`
+4. `LockApp.exe`
+5. 使用者明確提到的前台 app
+
+在前台鏈中要優先找：
+
+- 同步等待中的 `NtWait*` / `WaitForSingleObject*`
+- `WinHttp`, `webio`, `afd`, `rpc`, `cloudAP`, `aadcloudap`, `webauth`, `lsasrv`
+- 與 UI/登入完成條件直接相關的 event、semaphore、ALPC、socket cleanup
+
+#### 3-0B. 再找背景鏈（Background Pressure Chain）
+
+背景鏈可以是：
+
+- NTFS / filter / storage backlog
+- DPC / ISR 壓力
+- power IRP 卡住
+- memory pressure
+
+這些背景鏈**只有在能直接解釋前台鏈為何回不來時**，才可升格為 primary cause。
+
+#### 3-0C. 升格規則（避免誤判）
+
+若先看到背景熱點，例如 `NTFS`, `FltMgr`, `MsSecFlt`, `storport`，但同時又存在明確前台互動等待鏈，則：
+
+- 先把背景熱點標記為 `AMPLIFIER`，不是 `ROOT CAUSE`
+- 只有在 dump 內能證明「前台鏈正在等這個背景鏈」時，才升格為 `PRIMARY BLOCKER`
+- 若無法直接連結，只能在 Phase 8 寫成「次級放大因子 / secondary amplifier」
 
 ### 步驟 3-1：識別最上層 blocked thread
 
@@ -386,6 +470,25 @@ Root Blocker 是滿足以下條件之一的 thread 或 object：
   ↑ 什麼觸發了這個 driver 的問題行為？（hardware / power / race condition）
 [NORMAL STATE - baseline]
 ```
+
+### 雙時間線規則
+
+若同時存在「前台卡住鏈」與「背景壓力鏈」，Phase 4 必須先分兩條時間線描述，再決定是否收斂：
+
+```
+[VISIBLE / FOREGROUND LANE]
+使用者眼前看到的卡住流程（例如解鎖、登入、開檔、關機）
+
+[SYSTEM / BACKGROUND LANE]
+系統內部同時存在的壓力（例如 NTFS backlog、filter、storage、DPC）
+```
+
+規則：
+
+- 不能因為背景 lane 比較容易看到，就跳過 foreground lane
+- 不能把兩條 lane 混成一句沒有證據橋接的故事
+- 若 dump 只能證明 foreground lane，background lane 只能寫成 secondary context
+- 若 dump 只能證明 background lane，但使用者症狀明顯是前台互動卡住，必須在 Gaps 中承認前台鏈尚未封閉
 
 ### 常見觸發事件類型
 
@@ -703,6 +806,11 @@ Phase 8 的最終輸出，**必須固定依照以下 4 段順序產生**：
 
 如果缺少其中任何一段，視為根因宣告不合格。
 
+若是 layered failure，以上 4 段中都必須明確區分：
+
+- `Primary Blocker`：最直接解釋使用者眼前症狀的阻塞鏈
+- `Secondary Amplifier`：讓整機更糟、但未被直接證明是前台主阻塞的背景壓力
+
 #### 輸出要求
 
 必須回答以下 4 個問題：
@@ -918,6 +1026,19 @@ Gaps       : <如果有哪些資訊缺失，獲得後信心分數會提升到多
 - `高度懷疑` 不可寫成已定罪
 - `尚未直接證明` 不可留白；若真的沒有缺口，必須寫 `NONE`
 
+### 8-E.2 誤判防呆檢查（必填）
+
+在宣告 root cause 前，必須額外輸出：
+
+```
+[MISJUDGMENT GUARDRAIL]
+最容易誤判成主因的背景熱點：<例如 NTFS/filter/storage backlog>
+為什麼這次沒有把它直接定為主因：<因為前台鏈已有更直接證據>
+若要把它升格為主因，還缺哪一條證據橋接：<例如前台 thread 明確等待該 IRP / lock / file object>
+```
+
+目的：強迫自己回答「我是不是只因為某個 kernel 熱點很亮，就過早下結論？」
+
 ### 8-F. 對人解釋品質檢查（Human Explanation Quality Gate）
 
 在輸出最終報告前，必須自我檢查以下問題。若任一題回答為「否」，就重寫白話版：
@@ -927,6 +1048,8 @@ Gaps       : <如果有哪些資訊缺失，獲得後信心分數會提升到多
 3. 讀者能否分清楚「已證明的事」和「高度懷疑的事」？
 4. 白話版是否明確說出「不是什麼」？
 5. 白話版是否避免只是在重複 stack function 名稱？
+6. 若同時有 foreground lane 與 background lane，是否清楚分出誰是主阻塞、誰是放大因子？
+7. 是否明確檢查過 `lsass/winlogon/LogonUI/LockApp` 或使用者提到的前台 process，而不是只看 kernel 熱點？
 
 建議最後用以下模板收尾：
 

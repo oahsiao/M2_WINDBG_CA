@@ -1,0 +1,7 @@
+.process /r /p ffffbe85d56681c0
+.reload /user
+lm m cloudap*
+lm m aad*
+lm m winhttp*
+lm m webauth*
+q

@@ -1,0 +1,6 @@
+!thread ffffbe85f3dad080 1f
+!thread ffffbe860862d080 1f
+!irp ffffbe860c237ba0
+!object ffffbe8624ae3ce0
+dt nt!_DISPATCHER_HEADER ffffbe8624ae3ce0
+q
