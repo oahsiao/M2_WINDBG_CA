@@ -1,0 +1,13 @@
+vertarget
+.bugcheck
+dt nt!_POP_POWER_BUTTON_TRIAGE_BLOCK fffff805`bd507580
+!running
+!irql
+!locks
+!poaction
+!blackboxpnp
+!blackboxbsd
+!blackboxntfs
+!blackboxwinlogon
+!stacks 2
+q

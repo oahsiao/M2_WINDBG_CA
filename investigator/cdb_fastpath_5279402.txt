@@ -1,0 +1,5 @@
+vertarget
+.bugcheck
+!analyze -v
+lm t n
+q

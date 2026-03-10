@@ -1,0 +1,13 @@
+!fltkd.volumes
+!fltkd.volume ffffbe85c5ce3bf0
+!fltkd.filter MsSecFlt
+!fltkd.filter MEMEPMAgent
+!fltkd.filter bfs
+!fltkd.filter FileCrypt
+!fltkd.filter WdFilter
+lmvm MsSecFlt
+lmvm MEMEPMAgent
+lmvm bfs
+lmvm FileCrypt
+lmvm WdFilter
+q

@@ -1,0 +1,7 @@
+.sympath srv*C:\symbols*http://symweb;srv*C:\symbols*https://msdl.microsoft.com/download/symbols;srv*C:\symbols*\\desmo\release\Symbols;srv*C:\symbols*https://artifacts.dev.azure.com/msftdevices/_apis/symbol/symsrv;srv*C:\symbols*\\desmo\WDS\Devices\Tinos\SWFW\Symbols;srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols
+.chain
+vertarget
+.reload /f
+!analyze -v
+lm t n
+q
