@@ -99,7 +99,7 @@ srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols
 ### Dump 路徑
 
 ```
-D:\TEMP\WINDBG\ERIC\MEMORY.DMP
+D:\TEMP\WINDBG\MEMORY.DMP
 ```
 
 > 若同目錄存在多個 .dmp 檔案，自動啟用 **Multi-Dump Correlation Mode**（Phase 7）。
@@ -135,7 +135,7 @@ D:\TEMP\WINDBG\ERIC\MEMORY.DMP
 
 | 指令 | 預估耗時 | 原因 |
 |---|---|---|
-| `.reload /f` | 30s ～ 5min | 強制下載所有符號，視 symbol cache 狀況 |
+| `.reload /f` | 30s ～ 10min | 強制下載所有符號，視 symbol cache 狀況 |
 | `!analyze -v` | 20s ～ 3min | 完整自動分析，需解析大量符號 |
 | `!stacks 2` | 10s ～ 2min | 展開所有 thread 堆疊 |
 | `!process 0 0` | 5s ～ 1min | 全 process 列舉 |
