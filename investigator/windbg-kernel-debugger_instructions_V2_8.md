@@ -8,7 +8,7 @@ applyTo: "**"
   Internal reasoning, commands, and evidence fields remain in English.
 -->
 
-# Windows Kernel Dump — Autonomous Root Cause Investigation Engine v2.5
+# Windows Kernel Dump — Autonomous Root Cause Investigation Engine v2.8
 
 ---
 
@@ -65,26 +65,122 @@ EXPLAIN LIKE A HUMAN.  Every final conclusion must include a plain-language vers
 
 ### PowerShell 啟動 cdb.exe 規則（禁止違反）
 
-> ⚠️ **`-c` 參數的指令字串必須用雙引號 `"..."` 包住，絕對不可用單引號 `'...'`。**
->
-> 原因：PowerShell 中單引號會導致分號 `;` 被解析為 **PowerShell 指令分隔符**，
-> 使 `-c` 只拿到第一條指令，後續指令全部脫逸成 PowerShell 指令並報錯。
+> ⚠️ **核心規則：所有 PowerShell 腳本必須寫成 `.ps1` 檔案再執行，禁止在終端機直接輸入多行或單行腳本。**
 
-**正確範本：**
+#### 為什麼？
 
-```powershell
-# $dumpPath 從使用者對話擷取，例如 'D:\TEMP\WINDBG\5395227\MEMORY.DMP'
-$dumpPath = '<從對話擷取>'
-$dbg  = (Get-AppxPackage Microsoft.WinDbg.Fast).InstallLocation + "\amd64\cdb.exe"
-$sym  = 'srv*C:\symbols*http://symweb;srv*C:\symbols*https://msdl.microsoft.com/download/symbols;srv*C:\symbols*\\desmo\release\Symbols;srv*C:\symbols*https://artifacts.dev.azure.com/msftdevices/_apis/symbol/symsrv;srv*C:\symbols*\\desmo\WDS\Devices\Tinos\SWFW\Symbols;srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols'
-& $dbg -y $sym -z $dumpPath -c ".sympath; .chain; vertarget; q"
+在終端機（Terminal / Ran terminal command）直接執行 PowerShell 時，無論用分號 `;` 還是空格分隔陳述式，都會遇到以下問題：
+
+| 錯誤方式 | 症狀 |
+|---|---|
+| 用 `;` 串成一行 | `$sym` 賦值被截斷，symbol path 不完整 |
+| 用空格分隔陳述式 | PS 解析錯誤，變數未被正確賦值 |
+| 多行但在同一個 terminal 命令 | Shell 狀態異常，輸出被截斷或覆寫 |
+
+**唯一正確的做法：寫成 `.ps1` 腳本檔，用 `powershell -File` 執行。**
+
+---
+
+#### `.sympath` 在 cdb `-c` 字串中的致命限制
+
+> ⚠️ **`.sympath` 在 cdb 的 `-c` 字串中，分號是 symbol path 的分隔符，不是指令分隔符。**
+> 凡是 `-c` 字串中出現 `.sympath`，其後的所有內容（包含 `.reload`、`vertarget`、`!analyze` 等）
+> 都會被解析為 symbol path 的一部分，導致 `Error: Empty Path`。
+
+**錯誤示範：**
+```
+# ❌ .sympath 後面的所有指令全被當成 symbol path
+-c ".sympath; .reload /f; vertarget; !analyze -v; q"
+-c ".logopen xxx; .sympath; .chain; vertarget; q"
 ```
 
-| 參數 | 正確 | 錯誤 |
+**解法：把每個 cdb phase 的指令寫成獨立的 `.wds` 腳本檔，用 `$$><` 載入執行，完全避開 `-c` 的問題。**
+
+---
+
+#### 標準執行架構（兩個檔案，格式固定，不可修改結構）
+
+**檔案 1：`<dumpDir>\run_cdb.ps1`（PowerShell 啟動器）**
+
+```powershell
+# run_cdb.ps1
+param(
+    [string]$DumpPath,
+    [string]$ScriptFile
+)
+
+if (-not (Test-Path $DumpPath)) {
+    Write-Error "Dump not found: $DumpPath"
+    exit 1
+}
+
+$dbg = (Get-AppxPackage Microsoft.WinDbg.Fast).InstallLocation + '\amd64\cdb.exe'
+if (-not (Test-Path $dbg)) {
+    $dbg = (Get-AppxPackage Microsoft.WinDbg.Slow).InstallLocation + '\amd64\cdb.exe'
+}
+if (-not (Test-Path $dbg)) {
+    Write-Error "WinDbg not found."
+    exit 1
+}
+Write-Output "Using debugger: $dbg"
+
+$sym = 'srv*C:\symbols*http://symweb;srv*C:\symbols*https://msdl.microsoft.com/download/symbols;srv*C:\symbols*\\desmo\release\Symbols;srv*C:\symbols*https://artifacts.dev.azure.com/msftdevices/_apis/symbol/symsrv;srv*C:\symbols*\\desmo\WDS\Devices\Tinos\SWFW\Symbols;srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols'
+
+# -c 只傳入 $$>< 腳本載入指令，避開 .sympath 串接問題
+& $dbg -y $sym -z $DumpPath -c "`$`$><$ScriptFile"
+```
+
+**檔案 2：`<dumpDir>\phase0.wds`（cdb 指令腳本，每行一條指令）**
+
+```
+.logopen D:\TEMP\WINDBG\5395227\TRACE_phase0.txt
+.chain
+vertarget
+.bugcheck
+q
+```
+
+> **關鍵規則：**
+> - `.wds` 檔案中每行只寫**一條 cdb 指令**，不用分號串接
+> - **`.sympath` 永遠不寫進 `.wds` 或 `-c` 字串** — symbol path 已由 `-y $sym` 參數設定，無需再執行 `.sympath`
+> - `.logopen` 必須是第一行，確保所有輸出都被記錄
+
+#### 執行方式
+
+```powershell
+# 終端機只輸入這一行
+powershell -File "D:\TEMP\WINDBG\5395227\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\5395227\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\5395227\phase0.wds"
+```
+
+#### 禁止的所有變體（以下全部錯誤）
+
+```
+# ❌ .sympath 串接其他指令（最常見錯誤）
+-c ".sympath; .chain; vertarget; q"
+-c ".logopen xxx; .sympath; .reload /f; !analyze -v; q"
+
+# ❌ 用分號壓成一行
+$dumpPath='...'; $dbg=...; $sym='...'; & $dbg ...
+
+# ❌ 用空格分隔陳述式
+$dumpPath='...' $dbg=... $sym='...' & $dbg ...
+
+# ❌ 在 terminal 直接輸入多行（shell 狀態不穩定）
+$fast = (Get-AppxPackage ...).InstallLocation
+& $dbg ...
+
+# ❌ 用 -Command 傳入字串（引號嵌套問題）
+powershell -Command "$dumpPath='...'; & ..."
+```
+
+| 規則 | 正確 | 錯誤 |
 |---|---|---|
-| `-c` 指令字串 | `-c ".sympath; .chain; vertarget; q"` | `-c '.sympath; .chain; vertarget; q'` |
-| `$sym` symbol path | 用單引號 `'...'`（純字串，不展開變數） | 用雙引號（會意外展開 `$` 符號） |
-| `-c` 多條指令 | 雙引號內用分號分隔 | 每條指令用 PS 分號分開呼叫 |
+| 執行方式 | `powershell -File run_cdb.ps1` | 直接在終端機輸入 PS 腳本 |
+| cdb 指令 | 寫進 `.wds` 檔案，`$$><` 載入 | 放進 `-c "..."` 字串 |
+| `.sympath` | **永遠不放進 `-c` 或 `.wds`** | `-c ".sympath; ..."` |
+| symbol path | 由 `-y $sym` 參數設定 | 用 `.sympath` 指令設定 |
+| 多個 PS 陳述式 | 每行獨立，寫在 `.ps1` | 分號/空格壓成一行 |
+| `-c` 內容 | 只放 `$$><scriptfile` | 放任何含 `.sympath` 的指令串 |
 
 ### Symbol Path（禁止修改）
 
@@ -115,16 +211,14 @@ MEMORY.DMP 路徑來源：從使用者的對話訊息中擷取，不可 hardcode
 
 > 若同目錄存在多個 .dmp 檔案，自動啟用 **Multi-Dump Correlation Mode**（Phase 7）。
 
-**路徑擷取後，立即套用至啟動指令：**
+**路徑擷取後，立即產生 `.ps1` 與 `.wds` 腳本檔並執行：**
 
 ```powershell
-# $dumpPath 從使用者對話擷取
-$dumpPath = '<從對話擷取的完整 .DMP 路徑>'
-$dumpDir  = Split-Path $dumpPath -Parent
-$dbg      = (Get-AppxPackage Microsoft.WinDbg.Fast).InstallLocation + "\amd64\cdb.exe"
-$sym      = 'srv*C:\symbols*http://symweb;srv*C:\symbols*https://msdl.microsoft.com/download/symbols;srv*C:\symbols*\\desmo\release\Symbols;srv*C:\symbols*https://artifacts.dev.azure.com/msftdevices/_apis/symbol/symsrv;srv*C:\symbols*\\desmo\WDS\Devices\Tinos\SWFW\Symbols;srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols'
-& $dbg -y $sym -z $dumpPath -c ".sympath; .chain; vertarget; q"
+# 終端機只輸入這一行（替換路徑）
+powershell -File "D:\TEMP\WINDBG\5395227\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\5395227\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\5395227\phase0.wds"
 ```
+
+`run_cdb.ps1` 與 `phase0.wds` 內容請參考「PowerShell 啟動 cdb.exe 規則」章節的標準範本。
 
 ### 輸出目錄
 
@@ -237,20 +331,30 @@ Progress Estimate  : Phase <X> / 9 — 預計還需 <N> 輪收斂
 
 ### 步驟 0-1：基本驗證
 
-> ⚠️ **嚴重限制：`.symfix` 與 `.sympath` 必須單獨執行，絕對不可與其他指令用分號 `;` 串接。**
-> 原因：`.sympath` 語法中，分號是 **symbol path 的路徑分隔符**，不是指令分隔符。
-> 若串接，後面的 `.chain`、`vertarget` 等指令會被誤解析為 symbol path 字串，導致錯誤：
-> `Error: Execute .sympath(+) command attempts to access 'vertarget' failed`
+> ⚠️ **`.sympath` 永遠不放進 `.wds` 腳本或 `-c` 字串。**
+> symbol path 已由 `run_cdb.ps1` 的 `-y $sym` 參數設定完畢。
+> 在 `.wds` 腳本或 `-c` 字串中執行 `.sympath`，其後的所有指令都會被誤解析為 symbol path 字串。
 
-**正確執行順序（每條指令獨立執行，不串接）：**
+**Phase 0 的 `.wds` 腳本內容（`phase0.wds`，每行一條指令，不串接）：**
 
 ```
-1. .symfix
-2. .sympath srv*C:\symbols*http://symweb;srv*C:\symbols*https://msdl.microsoft.com/download/symbols;srv*C:\symbols*\\desmo\release\Symbols;srv*C:\symbols*https://artifacts.dev.azure.com/msftdevices/_apis/symbol/symsrv;srv*C:\symbols*\\desmo\WDS\Devices\Tinos\SWFW\Symbols;srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols
-3. .sympath
-4. .chain
-5. vertarget
+.logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase0.txt
+.chain
+vertarget
+.bugcheck
+q
 ```
+
+**執行方式：**
+
+```powershell
+powershell -File "D:\TEMP\WINDBG\<caseid>\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\<caseid>\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\<caseid>\phase0.wds"
+```
+
+從輸出中取得：
+- `vertarget`：OS 版本、build number、dump 時間
+- `.chain`：已載入的 extension DLL
+- `.bugcheck`：bugcheck code 與參數
 
 ### 步驟 0-2：Dump 類型判定
 
@@ -289,9 +393,19 @@ Status      : READY / BLOCKED
 
 ### 步驟 1-1：快速路徑檢查（Fast Path）
 
+**Phase 1 的 `.wds` 腳本內容（`phase1.wds`）：**
+
 ```
+.logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase1.txt
 .reload /f
 !analyze -v
+q
+```
+
+**執行方式：**
+
+```powershell
+powershell -File "D:\TEMP\WINDBG\<caseid>\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\<caseid>\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\<caseid>\phase1.wds"
 ```
 
 > ⚠️ **耗時警告：** `.reload /f` 需等待符號下載完成，**必須先輸出 [EXECUTING]，完成後輸出 [DONE]**，不可中斷。`!analyze -v` 同樣適用。
@@ -2081,11 +2195,16 @@ MUST NOT DO
   ❌ 不跳過「排除說明」（必須說明排除了哪些可能性）
   ❌ 不在 symbols 缺失時放棄分析 — 先嘗試 ASCII artifact 掃描
   ❌ 不把 LOW confidence 的 ASCII 片段直接當作確定證據
-  ❌ 不將 .symfix / .sympath 與其他指令用分號串接執行
-     （分號在 .sympath 語境下是路徑分隔符，不是指令分隔符，
-      串接會導致後續指令被誤解析為 symbol path 字串）
+  ❌ 不將 .sympath 放進 cdb 的 -c 字串或 .wds 腳本
+     （.sympath 後的分號是 symbol path 分隔符，後續指令全被誤解析）
+     正確做法：symbol path 由 -y $sym 參數設定，不需要再執行 .sympath
+  ❌ 不在終端機直接輸入 PowerShell 多行腳本（shell 狀態不穩定，輸出易被截斷）
+     正確做法：寫成 .ps1 檔案，用 powershell -File 執行
+  ❌ 不將 cdb 指令放進 -c "..." 字串（除了 $$>< scriptfile 以外）
+     正確做法：cdb 指令寫進 .wds 腳本檔，用 $$>< 載入
+  ❌ 不將多個 PowerShell 陳述式用分號 `;` 或空格壓成一行
+  ❌ 不用 -Command 字串方式傳入 PS 腳本（引號嵌套問題）
   ❌ 不在 PowerShell 啟動 cdb.exe 時，將 -c 參數的指令字串用單引號包住
-     （單引號使 PS 把分號解析為 PS 指令分隔符，導致 -c 只收到第一條指令）
   ❌ 不自行假設或 hardcode MEMORY.DMP 路徑 — 必須從使用者對話中擷取
      （每個 case 路徑不同，hardcode 會分析到錯誤的 dump 檔案）
 ```
