@@ -8,7 +8,7 @@ applyTo: "**"
   Internal reasoning, commands, and evidence fields remain in English.
 -->
 
-# Windows Kernel Dump — Autonomous Root Cause Investigation Engine v2.8
+# Windows Kernel Dump — Autonomous Root Cause Investigation Engine v2.9
 
 ---
 
@@ -127,7 +127,10 @@ Write-Output "Using debugger: $dbg"
 $sym = 'srv*C:\symbols*http://symweb;srv*C:\symbols*https://msdl.microsoft.com/download/symbols;srv*C:\symbols*\\desmo\release\Symbols;srv*C:\symbols*https://artifacts.dev.azure.com/msftdevices/_apis/symbol/symsrv;srv*C:\symbols*\\desmo\WDS\Devices\Tinos\SWFW\Symbols;srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols'
 
 # -c 只傳入 $$>< 腳本載入指令，避開 .sympath 串接問題
-& $dbg -y $sym -z $DumpPath -c "`$`$><$ScriptFile"
+# ⚠️ 禁止用 backtick 跳脫（"`$`$><$ScriptFile"）— 在某些 PS 版本展開不正確
+# 正確做法：字串拼接，確保 $$ 字面保留、路徑正確展開
+$cdbCmd = '$$><' + $ScriptFile
+& $dbg -y $sym -z $DumpPath -c $cdbCmd
 ```
 
 **檔案 2：`<dumpDir>\phase0.wds`（cdb 指令腳本，每行一條指令）**
@@ -144,6 +147,10 @@ q
 > - `.wds` 檔案中每行只寫**一條 cdb 指令**，不用分號串接
 > - **`.sympath` 永遠不寫進 `.wds` 或 `-c` 字串** — symbol path 已由 `-y $sym` 參數設定，無需再執行 `.sympath`
 > - `.logopen` 必須是第一行，確保所有輸出都被記錄
+> - **每個 phase 只能有一個對應的 `.wds` 檔案**，禁止把多個 phase 的指令混入同一個 `.wds`
+> - **`.wds` 檔案內容必須與本 instruction 範本完全一致**，禁止自行增減指令或改變順序
+> - **禁止在 `.wds` 檔案中使用分號 `;` 串接任何指令**，每條指令必須獨立一行（含換行符 `\n`）
+> - **產生 `.wds` 檔案時，必須用 `Set-Content` 搭配 `-Encoding UTF8` 寫入，禁止用 echo 或單行字串拼接**
 
 #### 執行方式
 
@@ -171,6 +178,25 @@ $fast = (Get-AppxPackage ...).InstallLocation
 
 # ❌ 用 -Command 傳入字串（引號嵌套問題）
 powershell -Command "$dumpPath='...'; & ..."
+
+# ❌ 用 backtick 跳脫方式組合 $$>< 指令（$$ 在某些 PS 版本展開不正確）
+& $dbg -y $sym -z $DumpPath -c "`$`$><$ScriptFile"
+
+# ❌ 在 .wds 檔案內用分號串接指令（最常見錯誤，導致 cdb Syntax error）
+# 錯誤的 phase0.wds 內容：
+# .logopen xxx;.chain;vertarget;.bugcheck;q
+# 或把多個 phase 的指令全部寫入同一個 .wds 檔案
+
+# ❌ 用 echo / Out-File 搭配單行字串產生 .wds（換行遺失，變成分號串接）
+".logopen xxx;.chain;vertarget;.bugcheck;q" | Out-File phase0.wds
+
+# ✅ 正確：用 $cdbCmd 字串拼接傳遞 $$>< 路徑
+$cdbCmd = '$$><' + $ScriptFile
+& $dbg -y $sym -z $DumpPath -c $cdbCmd
+
+# ✅ 正確：用 Set-Content + 字串陣列產生 .wds，確保每行獨立換行
+$lines = @(".logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase0.txt", ".chain", "vertarget", ".bugcheck", "q")
+Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase0.wds" -Value $lines -Encoding UTF8
 ```
 
 | 規則 | 正確 | 錯誤 |
@@ -180,7 +206,10 @@ powershell -Command "$dumpPath='...'; & ..."
 | `.sympath` | **永遠不放進 `-c` 或 `.wds`** | `-c ".sympath; ..."` |
 | symbol path | 由 `-y $sym` 參數設定 | 用 `.sympath` 指令設定 |
 | 多個 PS 陳述式 | 每行獨立，寫在 `.ps1` | 分號/空格壓成一行 |
-| `-c` 內容 | 只放 `$$><scriptfile` | 放任何含 `.sympath` 的指令串 |
+| `-c` 內容 | 只放 `$cdbCmd`（`'$$><' + $ScriptFile`） | backtick 跳脫或 `.sympath` 串接 |
+| `.wds` 檔案產生 | `Set-Content -Value $lines -Encoding UTF8` | `echo` / 單行字串 / `Out-File` |
+| `.wds` 指令格式 | 每行一條指令，無分號 | 用 `;` 串接多條指令 |
+| `.wds` 每個 phase | 各 phase 獨立一個 `.wds` 檔案 | 多個 phase 混入同一個 `.wds` |
 
 ### Symbol Path（禁止修改）
 
@@ -345,6 +374,25 @@ vertarget
 q
 ```
 
+> ⚠️ **產生 `.wds` 檔案的唯一正確方式（PowerShell）：**
+> ```powershell
+> $lines = @(
+>     ".logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase0.txt",
+>     ".chain",
+>     "vertarget",
+>     ".bugcheck",
+>     "q"
+> )
+> Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase0.wds" -Value $lines -Encoding UTF8
+> ```
+> **禁止用以下方式產生 `.wds`（會導致分號串接或換行遺失）：**
+> ```powershell
+> # ❌ echo 或 Out-File 搭配單行字串
+> ".logopen xxx;.chain;vertarget;.bugcheck;q" | Out-File phase0.wds
+> # ❌ Add-Content 多次呼叫但沒確認換行
+> # ❌ 直接在 -c 字串裡寫指令代替 .wds 檔案
+> ```
+
 **執行方式：**
 
 ```powershell
@@ -401,6 +449,17 @@ Status      : READY / BLOCKED
 !analyze -v
 q
 ```
+
+> ⚠️ **產生 `phase1.wds` 的唯一正確方式：**
+> ```powershell
+> $lines = @(
+>     ".logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase1.txt",
+>     ".reload /f",
+>     "!analyze -v",
+>     "q"
+> )
+> Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase1.wds" -Value $lines -Encoding UTF8
+> ```
 
 **執行方式：**
 
@@ -2205,6 +2264,18 @@ MUST NOT DO
   ❌ 不將多個 PowerShell 陳述式用分號 `;` 或空格壓成一行
   ❌ 不用 -Command 字串方式傳入 PS 腳本（引號嵌套問題）
   ❌ 不在 PowerShell 啟動 cdb.exe 時，將 -c 參數的指令字串用單引號包住
+  ❌ 不用 backtick 跳脫方式傳遞 $$>< 路徑（"`$`$><$ScriptFile"）
+     原因：$$ 在某些 PS 版本展開不正確，導致 .wds 指令被串成一行觸發 Syntax error
+     正確做法：$cdbCmd = '$$><' + $ScriptFile  然後  -c $cdbCmd
+  ❌ 不在 .wds 檔案中用分號 `;` 串接任何指令
+     原因：cdb 把分號解析為指令分隔符，導致 Syntax error 或指令被忽略
+     正確做法：每條指令獨立一行，用 Set-Content + 字串陣列寫入，確保換行正確
+  ❌ 不把多個 phase 的指令混入同一個 .wds 檔案
+     原因：各 phase 的 .logopen 路徑、指令集不同，混入會產生重複 logopen 或 Syntax error
+     正確做法：每個 phase 獨立一個 .wds 檔案（phase0.wds、phase1.wds、...）
+  ❌ 不用 echo、Out-File 搭配單行字串產生 .wds 檔案
+     原因：單行字串沒有換行符，寫入後內容變成分號串接的一行
+     正確做法：Set-Content -Value $lines -Encoding UTF8（$lines 為字串陣列）
   ❌ 不自行假設或 hardcode MEMORY.DMP 路徑 — 必須從使用者對話中擷取
      （每個 case 路徑不同，hardcode 會分析到錯誤的 dump 檔案）
 ```
