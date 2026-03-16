@@ -8,7 +8,7 @@ applyTo: "**"
   Internal reasoning, commands, and evidence fields remain in English.
 -->
 
-# Windows Kernel Dump — Autonomous Root Cause Investigation Engine v2.9
+# Windows Kernel Dump — Autonomous Root Cause Investigation Engine v3.2
 
 ---
 
@@ -21,6 +21,87 @@ applyTo: "**"
 - 每一條指令都必須有假設驅動，不盲目跑命令
 - 你的目標是找出「為什麼系統無法恢復」，而不只是描述症狀
 - 你要說出完整的故事：**什麼事情發生了、為什麼發生、為什麼系統沒有自救**
+
+---
+
+## ⚡ 初始化強制執行卡 / INITIALIZATION CHECKLIST
+
+> **這是每次對話開始時必須優先執行的步驟。在做任何分析之前，必須完整跑完以下流程。**
+> **不得跳過任何步驟，不得自行產生任何 `.wds` 或 `.ps1` 檔案。**
+
+---
+
+### ⚠️ 核心架構說明（必須先理解）
+
+本系統使用一個**預先存放在倉庫中的統一啟動腳本** `run_phase.ps1`：
+
+```
+Z:\M2_WINDBG_COPILOT_AGENT\scripts\run_phase.ps1
+```
+
+這個腳本會**自動**：
+- 尋找 cdb.exe 路徑
+- 根據指定的 Phase 在內部產生正確的 `.wds` 檔案（每行一條指令，無分號）
+- 執行 cdb
+- 驗證 `.wds` 無分號後才執行（內建防呆）
+
+**Copilot 的唯一工作：呼叫這個腳本，傳入正確的路徑和 Phase 名稱。**  
+**Copilot 禁止自行產生任何 `.wds`、`.ps1`、或任何中間檔案。**
+
+---
+
+### STEP 1 — 確認 `run_phase.ps1` 存在
+
+```powershell
+Test-Path "Z:\M2_WINDBG_COPILOT_AGENT\scripts\run_phase.ps1"
+```
+
+- 回傳 `True` → 繼續 STEP 2
+- 回傳 `False` → **停止，通知使用者腳本不存在，請將 `run_phase.ps1` 放入 `Z:\M2_WINDBG_COPILOT_AGENT\scripts\`**
+
+### STEP 2 — 確認 MEMORY.DMP 路徑（從使用者訊息中擷取）
+
+- 從對話中識別完整 `.DMP` 路徑，例如：`D:\TEMP\WINDBG\5285569\MEMORY_DMP_20260109-0903\MEMORY.DMP`
+- 若找不到路徑 → **停止，詢問使用者，不得自行假設**
+
+### STEP 3 — 執行 Phase 0（終端機只輸入這一行）
+
+```powershell
+powershell -File "Z:\M2_WINDBG_COPILOT_AGENT\scripts\run_phase.ps1" -DumpPath "<完整DMP路徑>" -Phase phase0
+```
+
+例如：
+```powershell
+powershell -File "Z:\M2_WINDBG_COPILOT_AGENT\scripts\run_phase.ps1" -DumpPath "D:\TEMP\WINDBG\5285569\MEMORY_DMP_20260109-0903\MEMORY.DMP" -Phase phase0
+```
+
+> ⛔ **禁止自行產生 `.wds` 或修改任何腳本。**
+> ⛔ **禁止用 `-c "..."` 直接傳入 cdb 指令。**
+> ⛔ **禁止把多條 PowerShell 陳述式用分號串接在終端機執行。**
+
+### STEP 4 — 確認輸出正常
+
+成功的輸出應包含：
+- `Using debugger: C:\...\cdb.exe`
+- `.wds written: ...phase0.wds (5 lines, no semicolons detected)`
+- `Opened log file '...TRACE_phase0.txt'`
+- `vertarget` 輸出（OS 版本、build、時間）
+- `.bugcheck` 輸出（bugcheck code 與參數）
+- **無 `Syntax error` 行**
+
+若仍出現 `Syntax error` → 立即停止，回報給使用者，不得繼續。
+
+### 後續各 Phase 執行方式（統一格式）
+
+```powershell
+# Phase 1
+powershell -File "Z:\M2_WINDBG_COPILOT_AGENT\scripts\run_phase.ps1" -DumpPath "<DMP路徑>" -Phase phase1
+
+# Phase 2
+powershell -File "Z:\M2_WINDBG_COPILOT_AGENT\scripts\run_phase.ps1" -DumpPath "<DMP路徑>" -Phase phase2
+```
+
+**每次只換 `-Phase` 的值，其他不變。**
 
 ---
 
@@ -53,14 +134,21 @@ EXPLAIN LIKE A HUMAN.  Every final conclusion must include a plain-language vers
 
 ### Debugger
 
+> ⚠️ **請優先依照頂部「初始化強制執行卡 STEP 1」流程尋找路徑，不得直接在此自行拼接。**
+
 ```
-先通過 Powershell 尋找WINDBG工具路徑
-指令如下
-(Get-AppxPackage Microsoft.WinDbg.Fast).InstallLocation + "\cdbX64.exe"
-或是
-(Get-AppxPackage Microsoft.WinDbg.Slow).InstallLocation + "\cdbX64.exe"
-找出 Windbg.Fast[優先] 或 Windbg.Slow 的路徑. 顯示在對話上,並用這個Windbg CLI 作為Debugger工具
-假如兩個都沒找到 就暫停並跳警告 該電腦沒有安裝 Windbg.Next
+正確的 cdb.exe 路徑格式：
+<InstallLocation>\amd64\cdb.exe
+
+例如：
+C:\Program Files\WindowsApps\Microsoft.WinDbg.Fast_...\amd64\cdb.exe
+
+❌ 錯誤路徑（常見誤用）：
+<InstallLocation>\cdbX64.exe         ← 此路徑不存在
+<InstallLocation>\cdb.exe            ← 缺少 amd64 子目錄
+
+優先順序：Microsoft.WinDbg.Fast > Microsoft.WinDbg.Slow
+兩者都找不到 → 停止並警告使用者安裝 WinDbg.Next
 ```
 
 ### PowerShell 啟動 cdb.exe 規則（禁止違反）
@@ -142,7 +230,7 @@ $cdbCmd = '$$><' + $ScriptFile
 **檔案 2：`<dumpDir>\phase0.wds`（cdb 指令腳本，每行一條指令）**
 
 ```
-.logopen D:\TEMP\WINDBG\5395227\TRACE_phase0.txt
+.logopen <dumpDir>\TRACE_phase0.txt
 .chain
 vertarget
 .bugcheck
@@ -156,13 +244,13 @@ q
 > - **每個 phase 只能有一個對應的 `.wds` 檔案**，禁止把多個 phase 的指令混入同一個 `.wds`
 > - **`.wds` 檔案內容必須與本 instruction 範本完全一致**，禁止自行增減指令或改變順序
 > - **禁止在 `.wds` 檔案中使用分號 `;` 串接任何指令**，每條指令必須獨立一行（含換行符 `\n`）
-> - **產生 `.wds` 檔案時，必須用 `Set-Content` 搭配 `-Encoding UTF8` 寫入，禁止用 echo 或單行字串拼接**
+> - **⛔ 產生 `.wds` 檔案的唯一方式：用 `file_create` 工具直接建立，禁止用終端機 `Set-Content`、`echo`、`Out-File` 或任何字串拼接方式產生**
 
 #### 執行方式
 
 ```powershell
 # 終端機只輸入這一行
-powershell -File "D:\TEMP\WINDBG\5395227\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\5395227\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\5395227\phase0.wds"
+powershell -File "D:\TEMP\WINDBG\<caseid>\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\<caseid>\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\<caseid>\phase0.wds"
 ```
 
 #### 禁止的所有變體（以下全部錯誤）
@@ -200,9 +288,8 @@ powershell -Command "$dumpPath='...'; & ..."
 $cdbCmd = '$$><' + $ScriptFile
 & $dbg -y $sym -z $DumpPath -c $cdbCmd
 
-# ✅ 正確：用 Set-Content + 字串陣列產生 .wds，確保每行獨立換行
-$lines = @(".logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase0.txt", ".chain", "vertarget", ".bugcheck", "q")
-Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase0.wds" -Value $lines -Encoding UTF8
+# ✅ 正確：.wds 檔案用 file_create 工具建立（內容為純文字，每行一條指令）
+# 禁止在終端機用 Set-Content / echo / Out-File 產生 .wds
 ```
 
 | 規則 | 正確 | 錯誤 |
@@ -213,7 +300,7 @@ Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase0.wds" -Value $lines -Encoding U
 | symbol path | 由 `-y $sym` 參數設定 | 用 `.sympath` 指令設定 |
 | 多個 PS 陳述式 | 每行獨立，寫在 `.ps1` | 分號/空格壓成一行 |
 | `-c` 內容 | 只放 `$cdbCmd`（`'$$><' + $ScriptFile`） | backtick 跳脫或 `.sympath` 串接 |
-| `.wds` 檔案產生 | `Set-Content -Value $lines -Encoding UTF8` | `echo` / 單行字串 / `Out-File` |
+| `.wds` 檔案產生 | **`file_create` 工具直接建立** | `Set-Content` / `echo` / `Out-File` / 終端機任何方式 |
 | `.wds` 指令格式 | 每行一條指令，無分號 | 用 `;` 串接多條指令 |
 | `.wds` 每個 phase | 各 phase 獨立一個 `.wds` 檔案 | 多個 phase 混入同一個 `.wds` |
 
@@ -234,9 +321,9 @@ srv*C:\symbols*\\desmo\release\UEFI-Intel\Symbols
 MEMORY.DMP 路徑來源：從使用者的對話訊息中擷取，不可 hardcode。
 
 使用者通常會說：
-  「通過 WINDBG 分析 D:\TEMP\WINDBG\5395227\MEMORY.DMP」
-  「分析 D:\TEMP\WINDBG\5395227\MEMORY.DMP」
-  「幫我看這個 dump：D:\TEMP\WINDBG\5395227\MEMORY.DMP」
+  「通過 WINDBG 分析 D:\TEMP\WINDBG\<caseid>\MEMORY.DMP」
+  「分析 D:\TEMP\WINDBG\<caseid>\MEMORY.DMP」
+  「幫我看這個 dump：D:\TEMP\WINDBG\<caseid>\MEMORY.DMP」
   或直接貼上路徑
 
 → 從對話中識別出完整的 .DMP 檔案路徑
@@ -250,7 +337,7 @@ MEMORY.DMP 路徑來源：從使用者的對話訊息中擷取，不可 hardcode
 
 ```powershell
 # 終端機只輸入這一行（替換路徑）
-powershell -File "D:\TEMP\WINDBG\5395227\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\5395227\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\5395227\phase0.wds"
+powershell -File "D:\TEMP\WINDBG\<caseid>\run_cdb.ps1" -DumpPath "D:\TEMP\WINDBG\<caseid>\MEMORY.DMP" -ScriptFile "D:\TEMP\WINDBG\<caseid>\phase0.wds"
 ```
 
 `run_cdb.ps1` 與 `phase0.wds` 內容請參考「PowerShell 啟動 cdb.exe 規則」章節的標準範本。
@@ -380,22 +467,20 @@ vertarget
 q
 ```
 
-> ⚠️ **產生 `.wds` 檔案的唯一正確方式（PowerShell）：**
-> ```powershell
-> $lines = @(
->     ".logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase0.txt",
->     ".chain",
->     "vertarget",
->     ".bugcheck",
->     "q"
-> )
-> Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase0.wds" -Value $lines -Encoding UTF8
+> ⚠️ **產生 `.wds` 檔案的唯一正確方式：用 `file_create` 工具直接建立，內容如下（每行一條指令）：**
 > ```
-> **禁止用以下方式產生 `.wds`（會導致分號串接或換行遺失）：**
+> .logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase0.txt
+> .chain
+> vertarget
+> .bugcheck
+> q
+> ```
+> **⛔ 禁止用以下方式產生 `.wds`（會導致分號串接或換行遺失）：**
 > ```powershell
 > # ❌ echo 或 Out-File 搭配單行字串
 > ".logopen xxx;.chain;vertarget;.bugcheck;q" | Out-File phase0.wds
-> # ❌ Add-Content 多次呼叫但沒確認換行
+> # ❌ Set-Content 搭配單行字串（換行可能遺失）
+> # ❌ 在終端機用任何方式產生 .wds
 > # ❌ 直接在 -c 字串裡寫指令代替 .wds 檔案
 > ```
 
@@ -456,16 +541,14 @@ Status      : READY / BLOCKED
 q
 ```
 
-> ⚠️ **產生 `phase1.wds` 的唯一正確方式：**
-> ```powershell
-> $lines = @(
->     ".logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase1.txt",
->     ".reload /f",
->     "!analyze -v",
->     "q"
-> )
-> Set-Content -Path "D:\TEMP\WINDBG\<caseid>\phase1.wds" -Value $lines -Encoding UTF8
+> ⚠️ **產生 `phase1.wds` 的唯一正確方式：用 `file_create` 工具直接建立，內容如下（每行一條指令）：**
 > ```
+> .logopen D:\TEMP\WINDBG\<caseid>\TRACE_phase1.txt
+> .reload /f
+> !analyze -v
+> q
+> ```
+> **⛔ 禁止在終端機用任何方式（Set-Content / echo / Out-File）產生 `.wds` 檔案。**
 
 **執行方式：**
 
@@ -2226,6 +2309,9 @@ Paragraph 3: Why the system could not recover — the recovery failure reason
 
 ```
 MUST DO
+  ✅ 每次對話開始時，必須先完整執行「初始化強制執行卡」STEP 1–6，才能進入 Phase 0
+  ✅ run_cdb.ps1 與 .wds 檔案必須用 file_create 工具建立，禁止在終端機用 Set-Content / echo 產生
+  ✅ 每個 .wds 檔案只寫每行一條指令，禁止分號串接，禁止合併多個 phase 的指令到同一個 .wds
   ✅ Phase 0 完成後，等待使用者輸入 "GO"
   ✅ Phase 1 分類後，根據類型決定調查路徑
   ✅ 每條指令前先完整陳述假設
@@ -2250,6 +2336,9 @@ MUST DO
   ✅ Phase 8.5 的類型專用指令集必須根據 Phase 1 分類填入正確內容，不可使用通用佔位符
 
 MUST NOT DO
+  ❌ 不在終端機用單行 PS 命令同時產生 run_cdb.ps1 與 .wds 並立刻執行（這是每次初始化報錯的根本原因）
+     正確做法：先用 file_create 建立 run_cdb.ps1，再用 file_create 建立 phase0.wds，最後才執行
+  ❌ 不把 .wds 檔案的多行指令用分號 `;` 串成一行（會導致 cdb Syntax error）
   ❌ 不盲目執行指令（每條都需要假設）
   ❌ 不重複執行已有完整輸出的指令
   ❌ 不把症狀當根因
@@ -2275,13 +2364,13 @@ MUST NOT DO
      正確做法：$cdbCmd = '$$><' + $ScriptFile  然後  -c $cdbCmd
   ❌ 不在 .wds 檔案中用分號 `;` 串接任何指令
      原因：cdb 把分號解析為指令分隔符，導致 Syntax error 或指令被忽略
-     正確做法：每條指令獨立一行，用 Set-Content + 字串陣列寫入，確保換行正確
+     正確做法：每條指令獨立一行，用 file_create 工具直接建立 .wds 檔案
   ❌ 不把多個 phase 的指令混入同一個 .wds 檔案
      原因：各 phase 的 .logopen 路徑、指令集不同，混入會產生重複 logopen 或 Syntax error
      正確做法：每個 phase 獨立一個 .wds 檔案（phase0.wds、phase1.wds、...）
-  ❌ 不用 echo、Out-File 搭配單行字串產生 .wds 檔案
-     原因：單行字串沒有換行符，寫入後內容變成分號串接的一行
-     正確做法：Set-Content -Value $lines -Encoding UTF8（$lines 為字串陣列）
+  ❌ 不用 echo、Out-File、Set-Content 搭配任何字串方式在終端機產生 .wds 檔案
+     原因：終端機產生的 .wds 無法保證每行獨立換行，極易變成分號串接的一行
+     正確做法：用 file_create 工具直接建立 .wds 檔案，內容為純文字每行一條指令
   ❌ 不自行假設或 hardcode MEMORY.DMP 路徑 — 必須從使用者對話中擷取
      （每個 case 路徑不同，hardcode 會分析到錯誤的 dump 檔案）
   ❌ 不在 run_cdb.ps1 中重複寫入 param(...) 區塊
